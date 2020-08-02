@@ -218,7 +218,8 @@ contract Ownable is Context {
 // Contract used to calculate stakes. Unused currently.
 
 abstract contract CalculatorInterface {
-    function calculateNumTokens(uint256 balance, uint256 daysStaked, address stakerAddress, uint256 totalSupply) public virtual returns (uint256);
+    function calculateNumTokens(uint256 balance, uint256 daysStaked, address stakerAddress, uint256 totalSupply) public view virtual returns (uint256);
+    function negativeDayCallback(int numerator, uint denominator, uint256 price, uint256 volume) public virtual;
     function randomness() public view virtual returns (uint256);
 }
 
@@ -227,6 +228,11 @@ abstract contract CalculatorInterface {
 abstract contract PampToken {
     function balanceOf(address account) public view virtual returns (uint256);
     function _burn(address account, uint256 amount) external virtual;
+    function mint(address account, uint256 amount) public virtual;
+}
+
+abstract contract PreviousContract {
+    function resetStakeTimeMigrateState(address addr) external virtual returns (uint256 startTimestamp, uint256 lastTimestamp);
 }
 
 
@@ -258,6 +264,7 @@ contract PampStaking is Ownable {
         uint denominator;       // Denominator of percent change
         uint price;         // In USD. 0001 is $0.001, 1000 is $1.000, 1001 is $1.001, etc
         uint volume;        // In whole USD (100 = $100)
+        uint streak;        // We save the current streak to use later
     }
     
     PampToken public token;     // ERC20 token contract that uses this upgradeable contract for staking and burning
@@ -271,6 +278,11 @@ contract PampStaking is Ownable {
         assert(_msgSender() == _nextStakingContract);
         _;
     }
+    
+    modifier onlyOracle() {
+        assert(_msgSender() == oracle);
+        _;
+    }
 
     
     mapping (address => staker) private _stakers;        // Mapping of all individuals staking/holding tokens greater than minStake
@@ -278,6 +290,8 @@ contract PampStaking is Ownable {
     mapping (address => string) private _whitelist;      // Mapping of all addresses that do not burn tokens on receive and send (generally other smart contracts). Mapping of address to reason (string)
     
     mapping (address => uint256) private _blacklist;     // Mapping of all addresses that receive a specific token burn when receiving. Mapping of address to percent burn (uint256)
+    
+    mapping (address => string) private _uniwhitelist; // Mapping of all addresses that do not burn tokens when sending to or selling on Uniswap. Mapping of address to reason (string)
     
 
     bool private _enableBurns; // Enable burning on transfer or fee on transfer
@@ -288,21 +302,29 @@ contract PampStaking is Ownable {
     
     address public _uniswapV2Pair;      // Uniswap pair address, done for fees on Uniswap sells
     
-    uint8 private _uniswapSellerBurnPercent;        // Uniswap sells pay a fee
+    uint public uniswapSellerBurnPercent;        // Uniswap sells pay a fee. Should be based on negative streaks
+    
+    uint public transferBurnPercent;
     
     bool private _enableUniswapDirectBurns;         // Enable seller fees on Uniswap
     
     uint256 private _minStake;                      // Minimum amount to stake
         
-    uint8 private _minStakeDurationDays;            // Minimum amount of time to claim staking rewards
+    uint8 public _minStakeDurationDays;            // Minimum amount of time to claim staking rewards
     
     uint8 private _minPercentIncrease;              // Minimum percent increase to enable rewards for the day. 10 = 1.0%, 100 = 10.0%
     
-    uint256 private _inflationAdjustmentFactor;     // Factor to adjust the amount of rewards (inflation) to be given out in a single day
+    uint256 public _inflationAdjustmentFactor;     // Factor to adjust the amount of rewards (inflation) to be given out in a single day
     
     uint256 private _streak;                        // Number of days in a row that the price has increased
     
+    uint public maxStreak;                          // Max number of days in a row we consider streak bonuses
+        
+    uint public negativeStreak;                     // Number of days in a row that the price has decreased
+    
     update public _lastUpdate;                      // latest price update
+
+    uint public lastNegativeUpdate;                 // last time the price was negative (unix timestamp)
     
     CalculatorInterface private _externalCalculator;    // external calculator to calculate the number of tokens given several variables (defined above). Currently unused
     
@@ -312,7 +334,9 @@ contract PampStaking is Ownable {
     
     bool private _freeze;                               // freeze all transfers in an emergency
     
-    bool private _enableHoldersDay;                     // once a month, holders receive a nice bump
+    bool public _enableHoldersDay;                     // once a month, holders receive a nice bump
+    
+    mapping (address => bool) public holdersDayRewarded; // Mapping to test whether an individual received his Holder's Day reward
     
     event StakerRemoved(address StakerAddress);     // Staker was removed due to balance dropping below _minStake
     
@@ -324,25 +348,41 @@ contract PampStaking is Ownable {
     
     event Transfer(address indexed from, address indexed to, uint256 value);        // self-explanatory
     
+    uint public maxStakingDays;
+    
+    uint public holdersDayRewardDenominator;
+    
+    update[] public updates;
+    
+    address public liquidityStakingContract;
+    
+    address public oracle;
+    
+    PreviousContract public previousStakingContract;
+    
     
     constructor (PampToken Token) public {
         token = Token;
-        _minStake = 500E18;
+        _minStake = 200E18;
         _inflationAdjustmentFactor = 100;
         _streak = 0;
-        _minStakeDurationDays = 0;
+        _minStakeDurationDays = 2;
         _useExternalCalc = false;
-        _uniswapSellerBurnPercent = 5;
+        uniswapSellerBurnPercent = 8;
         _enableBurns = false;
         _freeze = false;
         _minPercentIncrease = 10; // 1.0% min increase
         _enableUniswapDirectBurns = false;
-        
+        transferBurnPercent = 8;
+        _priceTarget1Hit = true;
+        oracle = msg.sender;
+        maxStreak = 7;
+        holdersDayRewardDenominator = 600;
     }
     
     // The owner (or price oracle) will call this function to update the price on days the coin is positive. On negative days, no update is made.
     
-    function updateState(uint numerator, uint denominator, uint256 price, uint256 volume) external onlyOwner {  // when chainlink is integrated a separate contract will call this function (onlyOwner state will be changed as well)
+    function updateState(uint numerator, uint denominator, uint256 price, uint256 volume) external onlyOracle {  // when chainlink is integrated a separate contract will call this function (onlyOwner state will be changed as well)
     
         require(numerator > 0 && denominator > 0 && price > 0 && volume > 0, "Parameters cannot be negative or zero");
         
@@ -350,14 +390,16 @@ contract PampStaking is Ownable {
             require(mulDiv(1000, numerator, denominator) >= _minPercentIncrease, "Increase must be at least _minPercentIncrease to count");
         }
         
-        uint8 daysSinceLastUpdate = uint8((block.timestamp - _lastUpdate.timestamp) / 86400);       // We calculate time since last price update in days. Overflow is possible but incredibly unlikely.
+        uint secondsSinceLastUpdate = (block.timestamp - _lastUpdate.timestamp);       // We calculate time since last price update in days.
         
-        if (daysSinceLastUpdate == 0) { // We should only update once per day, but block timestamps can vary
+        if (secondsSinceLastUpdate < 129600) { // We should only update once per day, but block timestamps can vary
             _streak++;
-        } else if (daysSinceLastUpdate == 1) {
-            _streak++;  // If we updated yesterday and today, we are on a streak
         } else {
             _streak = 1;
+        }
+        
+        if (_streak > maxStreak) {
+            _streak = maxStreak;
         }
         
         if (price >= 1000 && _priceTarget1Hit == false) { // 1000 = $1.00
@@ -372,8 +414,38 @@ contract PampStaking is Ownable {
             emit MassiveCelebration();
         }
         
-        _lastUpdate = update(block.timestamp, numerator, denominator, price, volume);
+        if(negativeStreak > 0) {
+            uniswapSellerBurnPercent = uniswapSellerBurnPercent - (negativeStreak * 2);
+            negativeStreak = 0;
+        }
+        
+        
+        _lastUpdate = update(block.timestamp, numerator, denominator, price, volume, _streak);
+        
+        updates.push(_lastUpdate);
 
+    }
+    
+    // We now update the smart contract on negative days. Currently this is only used to increase the Uniswap burn percent, but we may perform other funcionality in the future.
+    function updateStateNegative(int numerator, uint denominator, uint256 price, uint256 volume) external onlyOracle { 
+        require(numerator < _minPercentIncrease);
+        
+        uint secondsSinceLastUpdate = (block.timestamp - lastNegativeUpdate);       // We calculate time since last negative price update in days.
+        
+        if (secondsSinceLastUpdate < 129600) { // We should only update once per day, but block timestamps can vary
+            negativeStreak++;
+        } else {
+            negativeStreak = 0;
+        }
+        
+        _streak = 1;
+        
+        uniswapSellerBurnPercent = uniswapSellerBurnPercent + (negativeStreak * 2);     // Negative day streaks increase burn fees
+        transferBurnPercent = transferBurnPercent + (negativeStreak * 2);       // May have to contact exchanges about this
+    }
+    
+    function updateHoldersDay(bool enableHoldersDay)   external onlyOwner {
+        _enableHoldersDay = enableHoldersDay;
     }
     
     function resetStakeTime() external {    // This is only necessary if a new staking contract is deployed. Resets 0 timestamp to block.timestamp
@@ -400,6 +472,31 @@ contract PampStaking is Ownable {
         _stakers[addr].startTimestamp = block.timestamp;
     }
     
+    function migratePreviousState() external {      // Migrate state to new contract and reset state from old contract. Also reset current state to block.timestamp if it is zero otherwise
+        
+        require(_stakers[msg.sender].lastTimestamp == 0, "Last timestamp must be zero");
+        require(_stakers[msg.sender].startTimestamp == 0, "Start timestamp must be zero");
+        
+        (uint startTimestamp, uint lastTimestamp) = previousStakingContract.resetStakeTimeMigrateState(msg.sender);
+        
+        if(startTimestamp == 0) {
+            _stakers[msg.sender].startTimestamp = block.timestamp;
+        } else {
+            _stakers[msg.sender].startTimestamp = startTimestamp;
+        }
+        if(lastTimestamp == 0) {
+            _stakers[msg.sender].lastTimestamp = block.timestamp;
+        } else {
+            _stakers[msg.sender].lastTimestamp = lastTimestamp;
+        }
+        
+        if(_stakers[msg.sender].startTimestamp > _stakers[msg.sender].lastTimestamp) {
+            _stakers[msg.sender].lastTimestamp = block.timestamp;
+        }
+        
+        
+    }
+    
     function updateMyStakes(address stakerAddress, uint256 balance, uint256 totalSupply) external onlyToken returns (uint256) {     // This function is called by the token contract. Holders call the function on the token contract every day the price is positive to claim rewards.
         
         assert(balance > 0);
@@ -411,24 +508,17 @@ contract PampStaking is Ownable {
         
         assert(thisStaker.startTimestamp > 0/*,"Error: your start timestamp cannot be zero."*/);
         
-        assert((block.timestamp.sub(_lastUpdate.timestamp)) / 86400 == 0/*, "Stakes must be updated the same day of the latest update"*/);      // We recognize that block.timestamp can be gamed by miners to some extent, but from what we undertand block timestamps *cannot be before the last block* by consensus rules, otherwise they will fork the chain
-
-        
         assert(block.timestamp > thisStaker.lastTimestamp/*, "Error: block timestamp is not greater than your last timestamp!"*/);
         assert(_lastUpdate.timestamp > thisStaker.lastTimestamp/*, "Error: you can only update stakes once per day. You also cannot update stakes on the same day that you purchased them."*/);
-        
-        
         
         uint daysStaked = block.timestamp.sub(thisStaker.startTimestamp) / 86400;  // Calculate time staked in days
         
         assert(daysStaked >= _minStakeDurationDays/*, "You must stake for at least minStakeDurationDays to claim rewards"*/);
         assert(balance >= _minStake/*, "You must have a balance of at least minStake to claim rewards"*/);
-
-            
-        uint numTokens = calculateNumTokens(balance, daysStaked, stakerAddress, totalSupply);           // Calls token calculation function - this is either an external contract or the function in this contract
-        if (_enableHoldersDay && daysStaked >= 30) {
-            numTokens = mulDiv(balance, daysStaked, 600);   // Once a month, holders get a nice bump
-        }
+        
+        assert(thisStaker.lastTimestamp >= thisStaker.startTimestamp); // last timestamp should be greater than or equal to start timestamp
+        
+        uint numTokens = iterativelyCalculateOwedRewards(thisStaker.lastTimestamp, thisStaker.startTimestamp, balance, stakerAddress, totalSupply);
         
         _stakers[stakerAddress].lastTimestamp = block.timestamp;        // Again, this can be gamed to some extent, but *cannot be before the last block*
         emit StakesUpdated(numTokens);
@@ -437,8 +527,50 @@ contract PampStaking is Ownable {
     
         
     }
+    
+    // This function can be called once a month, when holder's day is enabled
+    function claimHoldersDay() external {
+        
+        require(!holdersDayRewarded[msg.sender]);
+        
+        staker memory thisStaker = _stakers[msg.sender];
+        uint daysStaked = block.timestamp.sub(thisStaker.startTimestamp) / 86400;  // Calculate time staked in days
+        
+        if (_enableHoldersDay && daysStaked >= 30) {
+            if (daysStaked > maxStakingDays) {      // If you stake for more than maxStakingDays days, you have hit the upper limit of the multiplier
+                daysStaked = maxStakingDays;
+            }
+            uint numTokens = mulDiv(token.balanceOf(msg.sender), daysStaked, holdersDayRewardDenominator);   // Once a month, holders get a nice bump
+            token.mint(msg.sender, numTokens);
+            holdersDayRewarded[msg.sender] == true;
+        }
+        
+    }
+    
+    
+    // Calculate owed rewards for several days, iterating back through the updates array. This is public so that the frontend can calculate expected rewards.
+    function iterativelyCalculateOwedRewards(uint stakerLastTimestamp, uint stakerStartTimestamp, uint balance, address stakerAddress, uint totalSupply) public view returns (uint256) {
+         
+        uint index = updates.length-1; // Start from the latest update and work our way back
+        
+        uint numTokens = 0;
+        
+        for(bool end = false; end == false && index >= 0; index--) {
+            
+            update memory nextUpdate = updates[index];      // Grab the last update from the array
+            if(stakerLastTimestamp > nextUpdate.timestamp || stakerStartTimestamp > nextUpdate.timestamp) { // If the staker's last timestamp or start timestamp is ahead of the next update, the staker is not owed the rewards from that update, and the updates array is in chronological order, so we end here
+                end = true;
+            } else {
+                uint estimatedDaysStaked = nextUpdate.timestamp.sub(stakerStartTimestamp) / 86400; // We estimate the staker's holding time from the point of view of this current update
+                numTokens += calculateNumTokens(nextUpdate.numerator, nextUpdate.denominator, nextUpdate.price, nextUpdate.volume, nextUpdate.streak, balance, estimatedDaysStaked, stakerAddress, totalSupply); // calculate the owed tokens from this update
+                balance += numTokens; // We support compound interest
+            }
+            
+        }
+        return numTokens;
+    }
 
-    function calculateNumTokens(uint256 balance, uint256 daysStaked, address stakerAddress, uint256 totalSupply) internal returns (uint256) {
+    function calculateNumTokens(uint numerator, uint denominator, uint price, uint volume, uint streak, uint256 balance, uint256 daysStaked, address stakerAddress, uint256 totalSupply) public view returns (uint256) { // This is public so that the Pamp frontend can calculate expected rewards without any js issues
         
         if (_useExternalCalc) {
             return _externalCalculator.calculateNumTokens(balance, daysStaked, stakerAddress, totalSupply); // Use external contract, if one is enabled (disabled by default, currently unused)
@@ -446,19 +578,17 @@ contract PampStaking is Ownable {
         
         uint256 inflationAdjustmentFactor = _inflationAdjustmentFactor;
         
-        if (_streak > 1) {
-            inflationAdjustmentFactor /= _streak;       // If there is a streak, we decrease the inflationAdjustmentFactor
+        if (streak > 1) {
+            inflationAdjustmentFactor /= streak;       // If there is a streak, we decrease the inflationAdjustmentFactor
         }
         
-        if (daysStaked > 60) {      // If you stake for more than 60 days, you have hit the upper limit of the multiplier
-            daysStaked = 60;
-        } else if (daysStaked == 0) {   // If the minimum days staked is zero, we change the number to 1 so we don't return zero below
-            daysStaked = 1;
+        if (daysStaked > maxStakingDays) {      // If you stake for more than maxStakingDays days, you have hit the upper limit of the multiplier
+            daysStaked = maxStakingDays;
+        } else if (daysStaked == 0 || daysStaked == 1) {   // If the minimum days staked is zero, we change the number to 1 so we don't return zero below
+            daysStaked = 2;
         }
         
-        uint marketCap = mulDiv(totalSupply, _lastUpdate.price, 1000E18);       // Market cap (including locked team tokens)
-        
-        uint ratio = marketCap.div(_lastUpdate.volume);     // Ratio of market cap to volume
+        uint ratio = mulDiv(totalSupply, price, 1000E18).div(volume);       // Ratio of market cap (including locked team tokens) to volume
         
         if (ratio > 50) {  // Too little volume. Decrease rewards. To be honest, this number was arbitrarily chosen.
             inflationAdjustmentFactor = inflationAdjustmentFactor.mul(10);
@@ -466,7 +596,7 @@ contract PampStaking is Ownable {
             inflationAdjustmentFactor = _inflationAdjustmentFactor;
         }
         
-        uint numTokens = mulDiv(balance, _lastUpdate.numerator * daysStaked, _lastUpdate.denominator * inflationAdjustmentFactor);      // Function that calculates how many tokens are due. See muldiv below.
+        uint numTokens = mulDiv(balance, numerator * daysStaked.div(2), denominator * inflationAdjustmentFactor);      // Function that calculates how many tokens are due. See muldiv below.
         uint tenPercent = mulDiv(balance, 1, 10);
         
         if (numTokens > tenPercent) {       // We don't allow a daily rewards of greater than ten percent of a holder's balance.
@@ -516,9 +646,6 @@ contract PampStaking is Ownable {
     function enableBurns(bool enabledBurns) external onlyOwner {
         _enableBurns = enabledBurns;
     }
-    function updateHoldersDay(bool enableHoldersDay)   external onlyOwner {
-        _enableHoldersDay = enableHoldersDay;
-    }
     
     function updateWhitelist(address addr, string calldata reason, bool remove) external onlyOwner returns (bool) {
         if (remove) {
@@ -526,6 +653,17 @@ contract PampStaking is Ownable {
             return true;
         } else {
             _whitelist[addr] = reason;
+            return true;
+        }
+        return false;        
+    }
+    
+    function updateUniWhitelist(address addr, string calldata reason, bool remove) external onlyOwner returns (bool) {
+        if (remove) {
+            delete _uniwhitelist[addr];
+            return true;
+        } else {
+            _uniwhitelist[addr] = reason;
             return true;
         }
         return false;        
@@ -553,7 +691,7 @@ contract PampStaking is Ownable {
     }
     
     function updateUniswapSellerBurnPercent(uint8 sellerBurnPercent) external onlyOwner {
-        _uniswapSellerBurnPercent = sellerBurnPercent;
+        uniswapSellerBurnPercent = sellerBurnPercent;
     }
     
     function freeze(bool enableFreeze) external onlyOwner {
@@ -565,6 +703,18 @@ contract PampStaking is Ownable {
         _nextStakingContract = nextContract;
     }
     
+    function updateLiquidityStakingContract(address _liquidityStakingContract) external onlyOwner {
+        liquidityStakingContract = _liquidityStakingContract;
+    }
+    
+    function updateOracle(address _oracle) external onlyOwner {
+        oracle = _oracle;
+    }
+    
+    function updatePreviousStakingContract(PreviousContract previousContract) external onlyOwner {
+        previousStakingContract = previousContract;
+    }
+    
     function getStaker(address staker) external view returns (uint256, uint256) {
         return (_stakers[staker].startTimestamp, _stakers[staker].lastTimestamp);
     }
@@ -573,8 +723,16 @@ contract PampStaking is Ownable {
         return _whitelist[addr];
     }
     
+    function getUniWhitelist(address addr) external view returns (string memory) {
+        return _uniwhitelist[addr];
+    }
+    
     function getBlacklist(address addr) external view returns (uint) {
         return _blacklist[addr];
+    }
+    
+    function removeLatestUpdate() external onlyOwner {
+        delete updates[updates.length - 1];
     }
 
     
@@ -615,15 +773,25 @@ contract PampStaking is Ownable {
     function streak() public view returns (uint) {
         return _streak;
     }
+    
+    function inflationAdjustmentFactor() public view returns (uint) {
+        return _inflationAdjustmentFactor;
+    }
 
 
     // Hooks the transfer() function on pamptoken. All transfers call this function. Takes in sender, recipient address and balances and amount and returns sender balance, recipient balance, and burned amount
     function transferHook(address sender, address recipient, uint256 amount, uint256 senderBalance, uint256 recipientBalance) external onlyToken returns (uint256, uint256, uint256) {
         
+        if(sender == liquidityStakingContract) {
+            token.mint(recipient, amount);          // Liquidity staking rewards are now part of inflation.
+            return (senderBalance, recipientBalance, 0);
+        }
+        
         assert(_freeze == false);
         assert(sender != recipient);
         assert(amount > 0);
         assert(senderBalance >= amount);
+        
         
         uint totalAmount = amount;
         bool shouldAddStaker = true;    // We assume that the recipient is a potential staker (not a smart contract)
@@ -631,7 +799,7 @@ contract PampStaking is Ownable {
         
         if (_enableBurns && bytes(_whitelist[sender]).length == 0 && bytes(_whitelist[recipient]).length == 0) { // Burns are enabled and neither the recipient nor the sender are whitelisted
                 
-            burnedAmount = mulDiv(amount, _randomness(), 100);  // Calculates the amount to be burned. Random integer between 1% and 4%. See _randomness() below
+            burnedAmount = mulDiv(amount, burnFee(), 100);  // Calculates the amount to be burned. Random integer between 1% and 4%. See _randomness() below
             
             
             if (_blacklist[recipient] > 0) {   //Transferring to a blacklisted address incurs a specific fee
@@ -651,8 +819,8 @@ contract PampStaking is Ownable {
             }
         } else if (recipient == _uniswapV2Pair) {    // Uniswap was used. This is a special case. Uniswap is burn on receive but whitelist on send, so sellers pay fee and buyers do not.
             shouldAddStaker = false;
-           if (_enableUniswapDirectBurns) {
-                burnedAmount = mulDiv(amount, _uniswapSellerBurnPercent, 100);     // Seller fee
+           if (_enableUniswapDirectBurns && bytes(_uniwhitelist[sender]).length == 0) { // We check if burns are enabled and if the sender is whitelisted
+                burnedAmount = mulDiv(amount, uniswapSellerBurnPercent, 100);     // Seller fee
                 if (burnedAmount > 0) {
                     if (burnedAmount > amount) {
                         totalAmount = 0;
@@ -674,8 +842,10 @@ contract PampStaking is Ownable {
         
         if (shouldAddStaker && _stakers[recipient].startTimestamp > 0 && recipientBalance > 0) {  // If you are currently staking, these should all be true
         
-            uint percent = mulDiv(1000000, totalAmount, recipientBalance);      // This is not really 'percent' it is just a number that represents the totalAmount as a fraction of the recipientBalance
-            assert(percent > 0);
+            uint percent = mulDiv(1000000, totalAmount, recipientBalance).div(2);      // This is not really 'percent' it is just a number that represents the totalAmount as a fraction of the recipientBalance. We divide by 2 to reduce the effects
+            if(percent == 0) {
+                percent == 2;
+            }
             if(percent.add(_stakers[recipient].startTimestamp) > block.timestamp) {         // We represent the 'percent' as seconds and add to the recipient's unix time
                 _stakers[recipient].startTimestamp = block.timestamp;
             } else {
@@ -690,7 +860,6 @@ contract PampStaking is Ownable {
             delete _stakers[recipient];
             emit StakerRemoved(recipient);
         }
-        
         
 
         senderBalance = senderBalance.sub(totalAmount, "ERC20: transfer amount exceeds balance");       // Normal ERC20 transfer
@@ -707,20 +876,18 @@ contract PampStaking is Ownable {
             emit StakerRemoved(sender);
         } else {
             _stakers[sender].startTimestamp = block.timestamp;      // Sending tokens automatically resets your 'holding time'
-            if (_stakers[sender].lastTimestamp == 0) {
-                _stakers[sender].lastTimestamp = block.timestamp;
-            }
+            _stakers[sender].lastTimestamp = block.timestamp;       // Can't claim after sending tokens
         }
     
         return (senderBalance, recipientBalance, burnedAmount);
     }
     
     
-    function _randomness() internal view returns (uint256) {        // Calculates token burn on transfer between 1% and 4% (integers)
+    function burnFee() internal view returns (uint256) {        // Calculates token burn on transfer between 1% and 4% (integers)
         if(_useExternalCalc) {
             return _externalCalculator.randomness();
         }
-        return 1 + uint256(keccak256(abi.encodePacked(blockhash(block.number-1), _msgSender())))%4;     // We use the previous block hash as entropy. Can be gamed by a miner to some extent, but we accept this.
+        return transferBurnPercent;
     }
     
     function burn(address account, uint256 amount) external onlyOwner {     // We allow ourselves to burn tokens in case they were minted due to a bug
