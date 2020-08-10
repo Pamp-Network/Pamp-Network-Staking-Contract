@@ -377,7 +377,7 @@ contract PampStaking {
             
         } else if (price >= 10000 && priceTarget2Hit == false) {   // It is written, so it shall be done
             priceTarget2Hit = true;
-            streak = 100;
+            streak = maxStreak;
             minStake = 100E18;        // Need $1000 to stake
             emit MassiveCelebration();
         }
@@ -486,8 +486,6 @@ contract PampStaking {
         emit StakesUpdated(numTokens);
         
         return numTokens;       // Token contract will add these tokens to the balance of stakerAddress
-    
-        
     }
     
     struct iterativeCalculationVariables {
@@ -517,7 +515,7 @@ contract PampStaking {
 
         vars.numTokens = 0;
         
-        for(bool end = false; end == false && vars.index >= 0; ) {
+        for(bool end = false; end == false;) {
             
             update memory nextUpdate = updates[vars.index];      // Grab the last update from the array
             if(stakerLastTimestamp > nextUpdate.timestamp || stakerStartTimestamp > nextUpdate.timestamp || vars.index == vars.bound) { // If the staker's last timestamp or start timestamp is ahead of the next update, the staker is not owed the rewards from that update, and the updates array is in chronological order, so we end here, we also check for the bound
@@ -584,10 +582,10 @@ contract PampStaking {
         
         require(!getHoldersDayRewarded(msg.sender), "You've already claimed Holder's Day");
         require(enableHoldersDay, "Holder's Day is not enabled");
-        
+
         staker memory thisStaker = stakers[msg.sender];
         uint daysStaked = block.timestamp.sub(thisStaker.startTimestamp) / 86400;  // Calculate time staked in days
-        
+        require(daysStaked >= 30, "You must stake for 30 days to claim holder's day rewards");
         if (enableHoldersDay && daysStaked >= 30) {
             if (daysStaked > maxStakingDays) {      // If you stake for more than maxStakingDays days, you have hit the upper limit of the multiplier
                 daysStaked = maxStakingDays;
@@ -823,16 +821,19 @@ contract PampStaking {
     function transferHook(address sender, address recipient, uint256 amount, uint256 senderBalance, uint256 recipientBalance) external onlyToken returns (uint256, uint256, uint256) {
         
         if(sender == liquidityStakingContract) {
-            token.mint(recipient, amount);          // Liquidity staking rewards are now part of inflation.
-            return (senderBalance, recipientBalance, 0);
+            // Liquidity staking rewards are now part of inflation.
+            return (senderBalance, recipientBalance.add(amount), 0);
         }
 
         if(checkPreviousStakingContractWhitelist){
-            if(bytes(previousStakingContract.getWhitelist(sender)).length > 0) {
-                whitelist[sender] = previousStakingContract.getWhitelist(sender);
+            string memory whitelistSender = previousStakingContract.getWhitelist(sender);
+            string memory whitelistRecipient = previousStakingContract.getWhitelist(recipient);
+            
+            if(bytes(whitelistSender).length > 0) {
+                whitelist[sender] = whitelistSender;
             }
-            if(bytes(previousStakingContract.getWhitelist(recipient)).length > 0) {
-                whitelist[recipient] = previousStakingContract.getWhitelist(sender);
+            if(bytes(whitelistRecipient).length > 0) {
+                whitelist[recipient] = whitelistRecipient;
             }
         }
         
@@ -947,9 +948,14 @@ contract PampStaking {
         token._burn(account, amount);
     }
     
-    function resetStakeTimeDebug(address account, uint timestamp, bool migrated) external onlyOwner {      // We allow ourselves to reset stake times in case they get changed incorrectly due to a bug
-        stakers[account].lastTimestamp = timestamp;
-        stakers[account].startTimestamp = timestamp;
+    function liquidityRewards(address recipient, uint amount) external {    // For future liquidity rewards contract (calling mint is better than adding to recipient balance in transfer)
+        require(msg.sender == liquidityStakingContract);
+        token.mint(recipient, amount);
+    }
+    
+    function resetStakeTimeDebug(address account, uint startTimestamp, uint lastTimestamp, bool migrated) external onlyOwner {      // We allow ourselves to reset stake times in case they get changed incorrectly due to a bug
+        stakers[account].lastTimestamp = startTimestamp;
+        stakers[account].startTimestamp = lastTimestamp;
         stakers[account].hasMigrated = migrated;
     }
 
