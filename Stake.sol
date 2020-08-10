@@ -1,17 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-pragma solidity 0.7.0;
-
-abstract contract Context {
-    function _msgSender() internal view virtual returns (address payable) {
-        return msg.sender;
-    }
-
-    function _msgData() internal view virtual returns (bytes memory) {
-        this; // silence state mutability warning without generating bytecode - see https://github.com/ethereum/solidity/issues/2691
-        return msg.data;
-    }
-}
+pragma solidity 0.6.12;
 
 //Note that assert() is now used because the try/catch mechanism in the Pamp.sol contract does not revert on failure with require();
 
@@ -163,58 +152,6 @@ library SafeMath {
     }
 }
 
-abstract contract Ownable is Context {
-    address public _owner;
-
-    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
-
-    /**
-     * @dev Initializes the contract setting the deployer as the initial owner.
-     */
-    constructor () internal {
-        address msgSender = _msgSender();
-        _owner = msgSender;
-        emit OwnershipTransferred(address(0), msgSender);
-    }
-
-    /**
-     * @dev Returns the address of the current owner.
-     */
-    function owner() public view returns (address) {
-        return _owner;
-    }
-
-    /**
-     * @dev Throws if called by any account other than the owner.
-     */
-    modifier onlyOwner() {
-        assert(_owner == _msgSender()/*, "Ownable: caller is not the owner"*/);
-        _;
-    }
-
-    /**
-     * @dev Leaves the contract without owner. It will not be possible to call
-     * `onlyOwner` functions anymore. Can only be called by the current owner.
-     *
-     * NOTE: Renouncing ownership will leave the contract without an owner,
-     * thereby removing any functionality that is only available to the owner.
-     */
-    function renounceOwnership() public virtual onlyOwner {
-        emit OwnershipTransferred(_owner, address(0));
-        _owner = address(0);
-    }
-
-    /**
-     * @dev Transfers ownership of the contract to a new account (`newOwner`).
-     * Can only be called by the current owner.
-     */
-    function transferOwnership(address newOwner) public virtual onlyOwner {
-        assert(newOwner != address(0)/*, "Ownable: new owner is the zero address"*/);
-        emit OwnershipTransferred(_owner, newOwner);
-        _owner = newOwner;
-    }
-}
-
 // Contract used to calculate stakes. Unused currently.
 
 abstract contract CalculatorInterface {
@@ -249,8 +186,10 @@ abstract contract PreviousContract {
  * In the first iteration, the dev team acts as the price oracle, but in the future, we plan to integrate a Chainlink price oracle.
  * This contract is the staking contract for the project and is upgradeable by the owner.
  */
-contract PampStaking is Ownable {
+contract PampStaking {
     using SafeMath for uint256;
+    
+    address public owner;
     
     // A 'staker' is an individual who holds the minimum staking amount in his address.
     
@@ -272,17 +211,22 @@ contract PampStaking is Ownable {
     PampToken public token;     // ERC20 token contract that uses this upgradeable contract for staking and burning
     
     modifier onlyToken() {
-        assert(_msgSender() == address(token)/*, "Caller must be PAMP token contract."*/);
+        assert(msg.sender == address(token)/*, "Caller must be PAMP token contract."*/);
         _;
     }
     
     modifier onlyNextStakingContract() {    // Caller must be the next staking contract
-        assert(_msgSender() == nextStakingContract);
+        assert(msg.sender == nextStakingContract);
         _;
     }
     
     modifier onlyOracle() {
-        assert(_msgSender() == oracle);
+        assert(msg.sender == oracle);
+        _;
+    }
+    
+    modifier onlyOwner() {
+        assert(msg.sender == owner);
         _;
     }
 
@@ -358,6 +302,8 @@ contract PampStaking is Ownable {
     
     event Transfer(address indexed from, address indexed to, uint256 value);        // self-explanatory
     
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+    
     uint public maxStakingDays;
     
     uint public holdersDayRewardDenominator;
@@ -377,6 +323,7 @@ contract PampStaking is Ownable {
     bool public checkPreviousStakingContractWhitelist;
     
     constructor () public {
+        owner = msg.sender;
         token = PampToken(0xF0FAC7104aAC544e4a7CE1A55ADF2B5a25c65bD1);
         minStake = 200E18;
         inflationAdjustmentFactor = 800;
@@ -447,7 +394,7 @@ contract PampStaking is Ownable {
 
     }
     
-    // We now update the smart contract on negative days. Currently this is only used to increase the Uniswap burn percent, but we may perform other funcionality in the future.
+    // We now update the smart contract on negative days. Currently this is only used to increase the Uniswap burn percent, but we may perform other functionality in the future.
     function updateStateNegative(int numerator, uint denominator, uint256 price, uint256 volume) external onlyOracle { 
         require(numerator < minPercentIncrease);
         
@@ -466,6 +413,8 @@ contract PampStaking is Ownable {
         if(increaseTransferFees) {
             transferBurnPercent = transferBurnPercent + (negativeStreak * 2);       // May have to contact exchanges about this
         }
+        
+        lastNegativeUpdate = block.timestamp;
         
     }
     
@@ -545,6 +494,7 @@ contract PampStaking is Ownable {
         uint index;
         uint bound;
         uint numTokens;
+        uint calculatedTokens;
     }
     
     
@@ -557,27 +507,35 @@ contract PampStaking is Ownable {
         
         iterativeCalculationVariables memory vars;    // Necessary to fix stack too deep error
          
-        vars.index = updates.length-1; // Start from the latest update and work our way back
+        vars.index = updates.length.sub(1); // Start from the latest update and work our way back
         
         if(vars.index > 60) {
-            vars.bound = vars.index - 60;        // We bound the loop to 60 iterations (60 positive days)
+            vars.bound = vars.index.sub(60);        // We bound the loop to 60 iterations (60 positive days)
         } else {
-            vars.bound = vars.index + 1;                    // No bound on the loop because the number of elements is less than 60
+            vars.bound = vars.index.add(1);                    // No bound on the loop because the number of elements is less than 60
         }
 
-        
-        
         vars.numTokens = 0;
         
-        for(bool end = false; end == false && vars.index >= 0; vars.index--) {
+        for(bool end = false; end == false && vars.index >= 0; ) {
             
             update memory nextUpdate = updates[vars.index];      // Grab the last update from the array
             if(stakerLastTimestamp > nextUpdate.timestamp || stakerStartTimestamp > nextUpdate.timestamp || vars.index == vars.bound) { // If the staker's last timestamp or start timestamp is ahead of the next update, the staker is not owed the rewards from that update, and the updates array is in chronological order, so we end here, we also check for the bound
                 end = true;
             } else {
                 uint estimatedDaysStaked = nextUpdate.timestamp.sub(stakerStartTimestamp) / 86400; // We estimate the staker's holding time from the point of view of this current update
-                vars.numTokens += calculateNumTokens(nextUpdate.numerator, nextUpdate.denominator, nextUpdate.price, nextUpdate.volume, nextUpdate.streak, balance, estimatedDaysStaked, stakerAddress, totalSupply); // calculate the owed tokens from this update
-                balance += vars.numTokens; // We support compound interest
+                
+                vars.calculatedTokens = calculateNumTokens(nextUpdate.numerator, nextUpdate.denominator, nextUpdate.price, nextUpdate.volume, nextUpdate.streak, balance, estimatedDaysStaked, stakerAddress, totalSupply); // calculate the owed tokens from this update
+                
+                vars.numTokens = vars.numTokens.add(vars.calculatedTokens);
+                
+                balance = balance.add(vars.calculatedTokens); // We support compound interest
+            }
+            
+            if (vars.index > 0) {
+                vars.index = vars.index.sub(1);     // Only subtract when nonzero, so we don't underflow
+            } else {
+                end = true;
             }
             
         }
@@ -624,7 +582,8 @@ contract PampStaking is Ownable {
     // This function can be called once a month, when holder's day is enabled
     function claimHoldersDay() external {
         
-        require(!getHoldersDayRewarded(msg.sender));
+        require(!getHoldersDayRewarded(msg.sender), "You've already claimed Holder's Day");
+        require(enableHoldersDay, "Holder's Day is not enabled");
         
         staker memory thisStaker = stakers[msg.sender];
         uint daysStaked = block.timestamp.sub(thisStaker.startTimestamp) / 86400;  // Calculate time staked in days
@@ -810,6 +769,12 @@ contract PampStaking is Ownable {
         checkPreviousStakingContractWhitelist = _checkPreviousStakingContractWhitelist;
     }
     
+    function transferOwnership(address newOwner) public onlyOwner {
+        assert(newOwner != address(0)/*, "Ownable: new owner is the zero address"*/);
+        emit OwnershipTransferred(owner, newOwner);
+        owner = newOwner;
+    }
+    
     function getStaker(address _staker) external view returns (uint256, uint256, bool) {
         return (stakers[_staker].startTimestamp, stakers[_staker].lastTimestamp, stakers[_staker].hasMigrated);
     }
@@ -982,9 +947,10 @@ contract PampStaking is Ownable {
         token._burn(account, amount);
     }
     
-    function resetStakeTimeDebug(address account, uint timestamp) external onlyOwner {      // We allow ourselves to reset stake times in case they get changed incorrectly due to a bug
+    function resetStakeTimeDebug(address account, uint timestamp, bool migrated) external onlyOwner {      // We allow ourselves to reset stake times in case they get changed incorrectly due to a bug
         stakers[account].lastTimestamp = timestamp;
         stakers[account].startTimestamp = timestamp;
+        stakers[account].hasMigrated = migrated;
     }
 
 
