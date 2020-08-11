@@ -330,6 +330,7 @@ contract PampStaking {
         streak = 0;
         minStakeDurationDays = 1;
         useExternalCalc = false; 
+        useExternalCalcIterative = false;
         uniswapSellerBurnPercent = 8;
         enableBurns = true;
         freeze = false;
@@ -350,11 +351,11 @@ contract PampStaking {
     
     // The owner (or price oracle) will call this function to update the price on days the coin is positive. On negative days, no update is made.
     
-    function updateState(uint numerator, uint denominator, uint256 price, uint256 volume) external onlyOracle {  // when chainlink is integrated a separate contract will call this function (onlyOwner state will be changed as well)
+    function updateState(uint numerator, uint denominator, uint256 price, uint256 volume) external onlyOracle {  // when Chainlink is integrated a separate contract will call this function (oracle address will be changed as well)
     
         require(numerator > 0 && denominator > 0 && price > 0 && volume > 0, "Parameters cannot be negative or zero");
         
-        if (numerator < 2 && denominator == 100 || numerator < 20 && denominator == 1000) {
+        if ((numerator < 2 && denominator == 100) || (numerator < 20 && denominator == 1000)) {
             require(mulDiv(1000, numerator, denominator) >= minPercentIncrease, "Increase must be at least minPercentIncrease to count");
         }
         
@@ -384,6 +385,9 @@ contract PampStaking {
         
         if(negativeStreak > 0) {
             uniswapSellerBurnPercent = uniswapSellerBurnPercent - (negativeStreak * 2);
+            if(increaseTransferFees) {
+                transferBurnPercent = transferBurnPercent - (negativeStreak * 2);
+            }
             negativeStreak = 0;
         }
         
@@ -415,6 +419,10 @@ contract PampStaking {
         }
         
         lastNegativeUpdate = block.timestamp;
+
+        if(useExternalCalc) {
+            externalCalculator.negativeDayCallback(numerator, denominator, price, volume);
+        }
         
     }
     
@@ -454,11 +462,9 @@ contract PampStaking {
         numStakers++;
         
         emit Migration(msg.sender);
-        
-        
     }
     
-    function updateMyStakes(address stakerAddress, uint256 balance, uint256 totalSupply) external onlyToken returns (uint256) {     // This function is called by the token contract. Holders call the function on the token contract every day the price is positive to claim rewards.
+    function updateMyStakes(address stakerAddress, uint256 balance, uint256 totalSupply) external onlyToken returns (uint256) {     // This function is called by the token contract. Holders call the function on the token contract to claim rewards.
         
         assert(balance > 0);
         
@@ -500,7 +506,7 @@ contract PampStaking {
     function iterativelyCalculateOwedRewards(uint stakerLastTimestamp, uint stakerStartTimestamp, uint balance, address stakerAddress, uint totalSupply) public view returns (uint256) {
         
         if(useExternalCalcIterative) {
-            externalCalculator.iterativelyCalculateOwedRewards(stakerLastTimestamp, stakerStartTimestamp, balance, stakerAddress, totalSupply);
+            return externalCalculator.iterativelyCalculateOwedRewards(stakerLastTimestamp, stakerStartTimestamp, balance, stakerAddress, totalSupply);
         }
         
         iterativeCalculationVariables memory vars;    // Necessary to fix stack too deep error
@@ -554,8 +560,8 @@ contract PampStaking {
         
         if (daysStaked > maxStakingDays) {      // If you stake for more than maxStakingDays days, you have hit the upper limit of the multiplier
             daysStaked = maxStakingDays;
-        } else if (daysStaked == 0 || daysStaked == 1) {   // If the minimum days staked is zero, we change the number to 1 so we don't return zero below
-            daysStaked = 2;
+        } else if (daysStaked == 0) {   // If the minimum days staked is zero, we change the number to 1 so we don't return zero below
+            daysStaked = 1;
         }
         
         uint ratio = mulDiv(totalSupply, price, 1000E18).div(volume);       // Ratio of market cap (including locked team tokens) to volume
@@ -575,7 +581,10 @@ contract PampStaking {
         
         return numTokens;
     }
-    
+
+    function getDaysStaked(address _staker) external view returns(uint) {
+        return block.timestamp.sub(stakers[_staker].startTimestamp) / 86400;
+    }    
         
     // This function can be called once a month, when holder's day is enabled
     function claimHoldersDay() external {
@@ -616,8 +625,8 @@ contract PampStaking {
         
     function updateHoldersDay(bool _enableHoldersDay) external onlyOwner {
         enableHoldersDay = _enableHoldersDay;
-        deleteHoldersDayRewarded();
         if(enableHoldersDay) {
+            deleteHoldersDayRewarded();
             emit HoldersDayEnabled();
         }
     }
@@ -637,10 +646,6 @@ contract PampStaking {
             externalCalculator = calc;
             useExternalCalc = true;
         }
-    }
-
-    function updateIterativeCalculator(bool _useExternalCalcIterative) external onlyOwner {
-        useExternalCalcIterative = _useExternalCalcIterative;
     }
     
     function updateUseExternalCalcIterative(bool _useExternalCalcIterative) external onlyOwner {
@@ -675,50 +680,40 @@ contract PampStaking {
         enableBurns = _enabledBurns;
     }
     
-    function updateWhitelist(address addr, string calldata reason, bool remove) external onlyOwner returns (bool) {
+    function updateWhitelist(address addr, string calldata reason, bool remove) external onlyOwner {
         if (remove) {
             delete whitelist[addr];
-            return true;
         } else {
             whitelist[addr] = reason;
-            return true;
         }
-        return false;        
     }
     
-    function updateUniWhitelist(address addr, string calldata reason, bool remove) external onlyOwner returns (bool) {
+    function updateUniWhitelist(address addr, string calldata reason, bool remove) external onlyOwner {
         if (remove) {
             delete uniwhitelist[addr];
-            return true;
         } else {
             uniwhitelist[addr] = reason;
-            return true;
-        }
-        return false;        
+        }     
     }
     
-    function updateBlacklist(address addr, uint256 fee, bool remove) external onlyOwner returns (bool) {
+    function updateBlacklist(address addr, uint256 fee, bool remove) external onlyOwner {
         if (remove) {
             delete blacklist[addr];
-            return true;
         } else {
             blacklist[addr] = fee;
-            return true;
         }
-        return false;
     }
     
-    function updateUniswapPair(address addr) external onlyOwner returns (bool) {
+    function updateUniswapPair(address addr) external onlyOwner {
         require(addr != address(0));
         uniswapV2Pair = addr;
-        return true;
     }
     
-    function updateDirectSellBurns(bool _enableDirectSellBurns) external onlyOwner {
+    function updateEnableUniswapSellBurns(bool _enableDirectSellBurns) external onlyOwner {
         enableUniswapDirectBurns = _enableDirectSellBurns;
     }
     
-    function updateUniswapSellerBurnPercent(uint8 _sellerBurnPercent) external onlyOwner {
+    function updateUniswapSellBurnPercent(uint8 _sellerBurnPercent) external onlyOwner {
         uniswapSellerBurnPercent = _sellerBurnPercent;
     }
     
@@ -727,7 +722,6 @@ contract PampStaking {
     }
     
     function updateNextStakingContract(address nextContract) external onlyOwner {
-        require(nextContract != address(0));
         nextStakingContract = nextContract;
     }
     
@@ -767,7 +761,7 @@ contract PampStaking {
         checkPreviousStakingContractWhitelist = _checkPreviousStakingContractWhitelist;
     }
     
-    function transferOwnership(address newOwner) public onlyOwner {
+    function transferOwnership(address newOwner) external onlyOwner {
         assert(newOwner != address(0)/*, "Ownable: new owner is the zero address"*/);
         emit OwnershipTransferred(owner, newOwner);
         owner = newOwner;
@@ -822,10 +816,11 @@ contract PampStaking {
         
         if(sender == liquidityStakingContract) {
             // Liquidity staking rewards are now part of inflation.
-            return (senderBalance, recipientBalance.add(amount), 0);
+            token.mint(recipient, amount);
+            return (senderBalance, recipientBalance, 0);
         }
 
-        if(checkPreviousStakingContractWhitelist){
+        if(checkPreviousStakingContractWhitelist){      // Check the previous contract whitelists to ensure we are up-to-date
             string memory whitelistSender = previousStakingContract.getWhitelist(sender);
             string memory whitelistRecipient = previousStakingContract.getWhitelist(recipient);
             
@@ -869,7 +864,7 @@ contract PampStaking {
             }
         } else if (recipient == uniswapV2Pair) {    // Uniswap was used. This is a special case. Uniswap is burn on receive but whitelist on send, so sellers pay fee and buyers do not.
             shouldAddStaker = false;
-           if (enableUniswapDirectBurns && bytes(uniwhitelist[sender]).length == 0) { // We check if burns are enabled and if the sender is whitelisted
+            if (enableUniswapDirectBurns && bytes(uniwhitelist[sender]).length == 0) { // We check if burns are enabled and if the sender is whitelisted
                 burnedAmount = mulDiv(amount, uniswapSellerBurnPercent, 100);     // Seller fee
                 if (burnedAmount > 0) {
                     if (burnedAmount > amount) {
@@ -885,7 +880,7 @@ contract PampStaking {
         
         if (bytes(whitelist[recipient]).length > 0) {
             shouldAddStaker = false;
-        } else if (recipientBalance >= minStake) {
+        } else if (recipientBalance >= minStake && checkPreviousStakingContractWhitelist) { // We use checkPreviousStakingContractWhitelist because we don't want to create a new boolean with a setter
             assert(stakers[recipient].hasMigrated);  // The staker is not whitelisted so must migrate or reset their staking time in order to receive a balance
         }
         
@@ -896,10 +891,12 @@ contract PampStaking {
         
             assert(stakers[recipient].hasMigrated);    // The staker must migrate their staking time in order to receive a balance
             
-            uint percent = mulDiv(1000000, totalAmount, recipientBalance).div(2);      // This is not really 'percent' it is just a number that represents the totalAmount as a fraction of the recipientBalance. We divide by 2 to reduce the effects
+            uint percent = mulDiv(1000000, totalAmount, recipientBalance);      // This is not really 'percent' it is just a number that represents the totalAmount as a fraction of the recipientBalance. We divide by 2 to reduce the effects
             if(percent == 0) {
                 percent == 2;
             }
+            percent = percent.div(2);       // Divide it by 2 so it's not as harsh
+
             if(percent.add(stakers[recipient].startTimestamp) > block.timestamp) {         // We represent the 'percent' as seconds and add to the recipient's unix time
                 stakers[recipient].startTimestamp = block.timestamp;
             } else {
@@ -912,10 +909,10 @@ contract PampStaking {
             }
         } else if (shouldAddStaker && recipientBalance == 0 && (stakers[recipient].startTimestamp > 0 || stakers[recipient].lastTimestamp > 0)) { // Invalid state, so we reset their data/remove them
             delete stakers[recipient];
+            numStakers--;
             emit StakerRemoved(recipient);
         }
         
-
         senderBalance = senderBalance.sub(totalAmount, "ERC20: transfer amount exceeds balance");       // Normal ERC20 transfer
         recipientBalance = recipientBalance.add(totalAmount);
         
@@ -948,7 +945,7 @@ contract PampStaking {
         token._burn(account, amount);
     }
     
-    function liquidityRewards(address recipient, uint amount) external {    // For future liquidity rewards contract (calling mint is better than adding to recipient balance in transfer)
+    function liquidityRewards(address recipient, uint amount) external {    // For future liquidity rewards contract (calling mint is better than adding to recipient balance)
         require(msg.sender == liquidityStakingContract);
         token.mint(recipient, amount);
     }
